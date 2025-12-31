@@ -395,6 +395,32 @@
                  :order-by [[:asc $id]]
                  :limit    3})))))))
 
+(mt/defdataset strings-that-need-escaping
+  [["escaping_table"
+    [{:field-name "string1", :base-type :type/Text}]
+    [["\\Backslash"]
+     ["Back\\slash"]
+     ["Backslash\\"]
+     ["_Underscore"]
+     ["Under_score"]
+     ["Underscore_"]
+     ["%ile"]
+     ["per%cent"]
+     ["100%"]]]])
+
+(deftest ^:parallel starts-with-escaped-char-in-literal-test
+  (mt/test-drivers (mt/normal-drivers)
+    (mt/dataset strings-that-need-escaping
+      (doseq [[lit exp] {"\\" [[1 "\\Backslash"]]
+                         "_"  [[4 "_Underscore"]]
+                         "%"  [[7 "%ile"]]}]
+        (testing (str "literal argument starts with " lit)
+          (is (=? exp
+                  (mt/rows
+                   (mt/run-mbql-query escaping_table
+                     {:filter   [:starts-with $string1 lit]
+                      :limit    3})))))))))
+
 ;;; --------------------------------------------------- ends-with ----------------------------------------------------
 
 (deftest ^:parallel ends-with-test
@@ -473,6 +499,19 @@
                  :order-by [[:asc $id]]
                  :limit 3})))))))
 
+(deftest ^:parallel ends-with-escaped-char-in-literal-test
+  (mt/test-drivers (mt/normal-drivers)
+    (mt/dataset strings-that-need-escaping
+      (doseq [[lit exp] {"\\" [[3 "Backslash\\"]]
+                         "_"  [[6 "Underscore_"]]
+                         "%"  [[9 "100%"]]}]
+        (testing (str "literal argument ends with " lit)
+          (is (=? exp
+                  (mt/rows
+                   (mt/run-mbql-query escaping_table
+                     {:filter   [:ends-with $string1 lit]
+                      :limit    3})))))))))
+
 ;;; ---------------------------------------------------- contains ----------------------------------------------------
 
 (deftest ^:parallel contains-test
@@ -546,6 +585,26 @@
                 {:filter   [:contains $name $name]
                  :order-by [[:asc $id]]
                  :limit 3})))))))
+
+(deftest ^:parallel contains-with-escaped-char-in-literal-test
+  (mt/test-drivers (mt/normal-drivers)
+    (mt/dataset strings-that-need-escaping
+      (doseq [[lit exp] {"\\" [[1 "\\Backslash"]
+                               [2 "Back\\slash"]
+                               [3 "Backslash\\"]]
+                         "_"  [[4 "_Underscore"]
+                               [5 "Under_score"]
+                               [6 "Underscore_"]]
+                         "%"  [[7 "%ile"]
+                               [8 "per%cent"]
+                               [9 "100%"]]}]
+        (testing (str "literal argument contains " lit)
+          (is (=? exp
+                  (mt/rows
+                   (mt/run-mbql-query escaping_table
+                     {:filter   [:contains $string1 lit]
+                      :order-by [[:asc $id]]
+                      :limit    8})))))))))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                             NESTED AND/OR CLAUSES                                              |

@@ -8,6 +8,8 @@ title: Driver interface changelog
 
 - Added `sql-jdbc.execute/db-type-name` multimethod. Override this if something more than the default is needed in your sql-jdbc-based driver. See the `:mysql` implementation as an example.
 
+- Added `sql.qp/escape-like-pattern` multimethod. The default implementation uses backslashes to escape `%` and `_` in literal `LIKE` patterns but some drivers need more characters escaped or a different method of escaping the standard metacharacters.
+
 ## Metabase 0.58.0
 
 - Added a `:collate` feature for drivers that support collation settings on text fields
