@@ -1168,7 +1168,6 @@
    :api  #{metabase.remote-sync.core
            metabase.remote-sync.init}
    :uses #{api
-           app-db
            models
            premium-features}}
 
@@ -2113,6 +2112,7 @@
            metabase-enterprise.remote-sync.init}
    :uses #{analytics
            api
+           app-db
            collections
            events
            models
