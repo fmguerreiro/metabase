@@ -20,6 +20,7 @@
    [metabase.driver.sql-jdbc.execute :as sql-jdbc.execute]
    [metabase.driver.util :as driver.u]
    [metabase.events.core :as events]
+   [metabase.lib.core :as lib]
    [metabase.query-processor.compile :as qp.compile]
    [metabase.query-processor.schema :as qp.schema]
    [metabase.request.core :as request]
@@ -122,6 +123,91 @@
     [:tag_ids {:optional true} [:maybe (ms/QueryVectorOf ms/IntGreaterThanOrEqualToZero)]]]]
   (get-transforms query-params))
 
+(defn- supported-incremental-filter-type?
+  "Returns true if the given base-type is supported for incremental filtering.
+
+  We only support temporal (timestamp/tz) and numeric (int/float) types."
+  [base-type]
+  (or (isa? base-type :type/Temporal)
+      (isa? base-type :type/Number)))
+
+(defn- extract-columns-from-query
+  "Extracts column names suitable for incremental transform checkpoint filtering.
+
+  This function is specifically for incremental transform checkpoint column selection.
+  It only returns columns with types supported for checkpoint filtering:
+  - Temporal types (timestamp, timestamp with timezone)
+  - Numeric types (integer, float, decimal)
+
+  Text, boolean, and other types are filtered out as they are not supported for
+  incremental checkpointing.
+
+  Returns a vector of column names (as strings), or nil if extraction fails.
+
+  The query is first compiled to native SQL, then uses PreparedStatement.getMetaData()
+  to inspect the query structure. This works for most modern JDBC drivers but may not
+  be supported by all drivers or for all query types."
+  [driver database-id query]
+  (try
+    (let [{:keys [query]} (qp.compile/compile query)]
+      (sql-jdbc.execute/do-with-connection-with-options
+       driver
+       database-id
+       {}
+       (fn [conn]
+         (with-open [^PreparedStatement stmt (sql-jdbc.execute/prepared-statement driver conn query [])]
+           (when-let [rsmeta (.getMetaData stmt)]
+             (let [columns (sql-jdbc.execute/column-metadata driver rsmeta)
+                   filtered-columns (filter (comp supported-incremental-filter-type? :base_type) columns)]
+               (seq (mapv :name filtered-columns))))))))
+    (catch Exception e
+      (log/debugf e "Failed to extract columns from query: %s" (ex-message e))
+      nil)))
+
+(defn- validate-incremental-column-type!
+  "Validates that the checkpoint column for an incremental transform has a supported type.
+
+  For MBQL/Python transforms, resolves the column from the query using the unique key.
+  For native queries, extracts columns from the query and checks the checkpoint-filter column.
+
+  Throws a 400 error if the column type is not supported or cannot be resolved."
+  [{:keys [source]}]
+  (when-let [{:keys [checkpoint-filter checkpoint-filter-unique-key] strategy-type :type}
+             (:source-incremental-strategy source)]
+    (when (= "checkpoint" strategy-type)
+      (let [{query-type :type query-obj :query} source]
+        (case (keyword query-type)
+          :query
+          (let [database-id (:database query-obj)
+                database (api/check-404 (t2/select-one :model/Database :id database-id))
+                driver-name (driver/the-initialized-driver (:engine database))]
+            (cond
+              ;; For MBQL/Python with unique key, resolve column from query metadata
+              checkpoint-filter-unique-key
+              (let [column (lib/column-with-unique-key query-obj checkpoint-filter-unique-key)]
+                (api/check-400 column
+                               (deferred-tru "Checkpoint column not found in query."))
+                (api/check-400 (supported-incremental-filter-type? (:base-type column))
+                               (deferred-tru "Checkpoint column type {0} is not supported. Only numeric and temporal types are supported for incremental filtering."
+                                             (pr-str (:base-type column)))))
+
+              ;; For native query with checkpoint-filter, extract columns and validate
+              checkpoint-filter
+              (let [columns (extract-columns-from-query driver-name database-id query-obj)]
+                (api/check-400 columns
+                               (deferred-tru "Could not extract columns from query."))
+                (api/check-400 (some #{checkpoint-filter} columns)
+                               (deferred-tru "Checkpoint column ''{0}'' not found in query results or has unsupported type. Only numeric and temporal columns are supported for incremental filtering."
+                                             checkpoint-filter)))))
+
+          :python
+          (when checkpoint-filter-unique-key
+            ;; Python transforms should have the column resolved from source tables
+            ;; The unique key will be validated when the transform runs
+            nil)
+
+          nil)))))
+
 ;; TODO (Cam 2025-11-25) please add a response schema to this API endpoint, it makes it easier for our customers to
 ;; use our API + we will need it when we make auto-TypeScript-signature generation happen
 ;;
@@ -141,6 +227,7 @@
   (api/check-superuser)
   (check-database-feature body)
   (check-feature-enabled! body)
+  (validate-incremental-column-type! body)
 
   (api/check (not (transforms.util/target-table-exists? body))
              403
@@ -250,6 +337,7 @@
                       ;; we must validate on a full transform object
                       (check-feature-enabled! new)
                       (check-database-feature new)
+                      (validate-incremental-column-type! new)
                       (when (transforms.util/query-transform? old)
                         (when-let [{:keys [cycle-str]} (transforms.ordering/get-transform-cycle new)]
                           (throw (ex-info (str "Cyclic transform definitions detected: " cycle-str)
@@ -334,30 +422,6 @@
                               :run_id run-id})
           (assoc :status 202)))))
 
-(defn- extract-columns-from-query
-  "Attempts to extract column names from an MBQL query without executing it.
-
-  Returns a vector of column names (as strings), or nil if extraction fails.
-
-  The query is first compiled to native SQL, hen uses PreparedStatement.getMetaData()
-  to inspect the query structure. This works for most modern JDBC drivers but may not
-  be supported by all drivers or for all query types."
-  [driver database-id query]
-  (try
-    (let [{:keys [query]} (qp.compile/compile query)]
-      (sql-jdbc.execute/do-with-connection-with-options
-       driver
-       database-id
-       {}
-       (fn [conn]
-         (with-open [^PreparedStatement stmt (sql-jdbc.execute/prepared-statement driver conn query [])]
-           (when-let [rsmeta (.getMetaData stmt)]
-             (let [columns (sql-jdbc.execute/column-metadata driver rsmeta)]
-               (seq (mapv :name columns))))))))
-    (catch Exception e
-      (log/debugf e "Failed to extract columns from query: %s" (ex-message e))
-      nil)))
-
 (defn- simple-native-query?
   "Checks if a native SQL query string is simple enough for automatic checkpoint insertion."
   [sql-string]
@@ -403,11 +467,17 @@
 ;;
 #_{:clj-kondo/ignore [:metabase/validate-defendpoint-has-response-schema]}
 (api.macros/defendpoint :post "/extract-columns"
-  "Extract column names from an MBQL query without executing it.
+  "Extract column names suitable for incremental transform checkpoint filtering.
 
-  Compiles the query to native SQL using [[qp.compile/compile-with-inline-parameters]],
+  This endpoint is specifically for populating the checkpoint column dropdown in
+  incremental transforms. It only returns columns with types supported for checkpoint
+  filtering: temporal (timestamp/tz) and numeric (int/float) types.
+
+  Text, boolean, and other unsupported column types are filtered out.
+
+  The query is compiled to native SQL using [[qp.compile/compile-with-inline-parameters]],
   which handles parameterized queries with template tags. Then extracts column names
-  using PreparedStatement metadata.
+  and types using PreparedStatement metadata.
 
   Returns a map with a :columns key containing a vector of column names (strings).
   If extraction fails, returns nil for :columns."
@@ -417,9 +487,9 @@
                        [:query ::qp.schema/any-query]]]
   (api/check-superuser)
   (let [database-id (:database query)
-        database (api/check-404 (t2/select-one :model/Database :id database-id))
+        database    (api/check-404 (t2/select-one :model/Database :id database-id))
         driver-name (driver/the-initialized-driver (:engine database))
-        columns (extract-columns-from-query driver-name database-id query)]
+        columns     (extract-columns-from-query driver-name database-id query)]
     {:columns columns}))
 
 (def ^{:arglists '([request respond raise])} routes
